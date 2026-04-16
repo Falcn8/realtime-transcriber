@@ -19,6 +19,29 @@
 				"build"
 			],
 			"isBackground": false
+		},
+		{
+			"label": "Vercel build",
+			"type": "shell",
+			"command": "vercel",
+			"args": [
+				"build"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Vercel pull and build",
+			"type": "shell",
+			"command": "vercel",
+			"args": [
+				"pull",
+				"--yes",
+				"--environment=production",
+				"&&",
+				"vercel",
+				"build"
+			],
+			"isBackground": false
 		}
 	]
 }
