@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ja">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>リアルタイム文字起こし</title>
+        <link rel="stylesheet" href="styles.css">
+        <link rel="icon" href="data:,">
+    </head>
+    <body>
+        <div class="page">
+            <header class="hero">
+                <h1>リアルタイム文字起こし</h1>
+            </header>
+
+            <section class="panel main-panel">
+                <div class="status-row">
+                    <span id="status-badge" class="pill warn">確認中</span>
+                    <div class="meta-hidden" aria-hidden="true">
+                        <span id="metric-browser">detecting...</span>
+                        <span id="metric-language">ja</span>
+                        <span id="metric-listening">off</span>
+                        <span id="metric-log-count">0</span>
+                        <span id="metric-autoclear">30 s</span>
+                    </div>
+                </div>
+
+                <div class="title-row">
+                    <input id="lecture-title" type="text" placeholder="タイトル">
+                </div>
+
+                <div id="caption-stage" class="caption-stage">
+                    <div class="caption-noise"></div>
+                    <div class="caption-frame">
+                        <pre id="result-text" class="caption-text">開始するとここに表示されます。</pre>
+                    </div>
+                </div>
+
+                <p id="session-message" class="message"></p>
+
+                <div class="action-row">
+                    <button id="toggle-recognition" class="primary" onclick="speechApp.toggleRecognition()">開始</button>
+                    <button id="download-log" onclick="speechApp.downloadLog()" disabled>ダウンロード</button>
+                    <button id="clear-all" onclick="speechApp.clearAll()">クリア</button>
+                </div>
+            </section>
+
+            <details class="panel details-panel">
+                <summary>設定</summary>
+                <div class="settings-grid">
+                    <label class="field">
+                        <span>言語</span>
+                        <select id="select-language"></select>
+                    </label>
+
+                    <label class="field">
+                        <span>地域</span>
+                        <select id="select-dialect"></select>
+                    </label>
+
+                    <label class="field">
+                        <span>ライブ表示の自動クリア</span>
+                        <select id="select-autoclear">
+                            <option value="0">オフ</option>
+                            <option value="10">10秒</option>
+                            <option value="20">20秒</option>
+                            <option value="30">30秒</option>
+                            <option value="45">45秒</option>
+                            <option value="60">60秒</option>
+                        </select>
+                    </label>
+
+                    <label class="field slider-field">
+                        <span>字幕サイズ <output id="value-font-size">38 px</output></span>
+                        <input id="slider-font-size" type="range" min="28" max="96" step="2">
+                    </label>
+
+                    <label class="field slider-field">
+                        <span>行間 <output id="value-line-height">1.45</output></span>
+                        <input id="slider-line-height" type="range" min="1.05" max="1.8" step="0.05">
+                    </label>
+
+                    <div class="field checks">
+                        <label><input id="checkbox-timestamps" type="checkbox"> ログに時刻を付ける</label>
+                        <label><input id="checkbox-show-log" type="checkbox"> ログを表示</label>
+                    </div>
+
+                    <div class="field action-field">
+                        <button id="focus-caption" onclick="speechApp.toggleFullscreen()">全画面</button>
+                        <button id="reset-settings" onclick="speechApp.resetSettings()">初期化</button>
+                    </div>
+                </div>
+            </details>
+
+            <details id="log-panel" class="panel details-panel">
+                <summary>ログ</summary>
+                <textarea id="result-log" class="log-area" spellcheck="false" placeholder="文字起こしされた文章がここに表示されます。"></textarea>
+            </details>
+
+            <details class="panel debug details-panel">
+                <summary>デバッグ</summary>
+                <textarea id="output" rows="10"></textarea>
+            </details>
+        </div>
+
+        <script src="main.js"></script>
+    </body>
+</html>

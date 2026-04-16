@@ -1,0 +1,13 @@
+{
+  "name": "kotoba-live-transcriber",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/main.js --bundle --platform=browser --format=iife --outfile=web/main.js"
+  },
+  "dependencies": {
+    "@vercel/analytics": "^2.0.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
+}

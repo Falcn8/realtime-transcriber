@@ -1,0 +1,24 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Install analytics and build",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"install",
+				"@vercel/analytics",
+				"&&",
+				"npm",
+				"install",
+				"-D",
+				"esbuild",
+				"&&",
+				"npm",
+				"run",
+				"build"
+			],
+			"isBackground": false
+		}
+	]
+}
