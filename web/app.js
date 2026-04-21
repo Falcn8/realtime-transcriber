@@ -2,7 +2,10 @@ const SETTINGS_KEY = 'speech_to_text_overlay_settings';
 const SETTINGS_VERSION = 2;
 const PLACEHOLDER_TEXT = '開始するとここに表示されます。';
 const WINDOWED_CAPTION_CHAR_LIMIT = 90;
-const TRANSFORMERS_JS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+const TRANSFORMERS_JS_CDN_CANDIDATES = [
+    'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1',
+    'https://esm.sh/@huggingface/transformers@3.8.1',
+];
 const LOCAL_WHISPER_MODEL = 'Xenova/whisper-tiny';
 const LOCAL_WHISPER_SAMPLE_RATE = 16000;
 const LOCAL_RECORDER_MIME_TYPES = [
@@ -321,8 +324,7 @@ function extractLatestSentence(text) {
         return '';
     }
 
-    const sentences = normalized
-        .split(/(?<=[。！？.!?])\s*/)
+    const sentences = (normalized.match(/[^。！？.!?]+[。！？.!?]?/g) || [])
         .map((part) => part.trim())
         .filter(Boolean);
 
@@ -691,13 +693,53 @@ async function ensureLocalTranscriber() {
     if (!state.localTranscriberPromise) {
         state.localTranscriberPromise = (async () => {
             updateMessage('ローカル音声モデルを読み込んでいます（初回は時間がかかります）。');
-            const { env, pipeline } = await import(TRANSFORMERS_JS_CDN);
+            let dynamicImport = null;
+            try {
+                dynamicImport = new Function('source', 'return import(source);');
+            } catch (error) {
+                throw new Error('この Safari はローカル音声モデルの読み込み方式に未対応です。Safari を更新してください。');
+            }
+
+            let moduleRef = null;
+            let lastError = null;
+
+            for (const source of TRANSFORMERS_JS_CDN_CANDIDATES) {
+                try {
+                    moduleRef = await dynamicImport(source);
+                    break;
+                } catch (error) {
+                    lastError = error;
+                }
+            }
+
+            if (!moduleRef) {
+                const importError = new Error('ローカルモデルを読み込めませんでした。Safari を最新に更新してください。');
+                importError.cause = lastError;
+                throw importError;
+            }
+
+            const { env, pipeline } = moduleRef;
             env.allowLocalModels = false;
             env.useBrowserCache = true;
 
-            const transcriber = await pipeline('automatic-speech-recognition', LOCAL_WHISPER_MODEL, {
-                dtype: 'q8',
-            });
+            let transcriber = null;
+            let transcriberError = null;
+            const dtypes = ['q4', 'q8'];
+
+            for (const dtype of dtypes) {
+                try {
+                    transcriber = await pipeline('automatic-speech-recognition', LOCAL_WHISPER_MODEL, { dtype });
+                    break;
+                } catch (error) {
+                    transcriberError = error;
+                }
+            }
+
+            if (!transcriber) {
+                const initError = new Error('ローカル音声モデルの初期化に失敗しました。');
+                initError.cause = transcriberError;
+                throw initError;
+            }
 
             state.localTranscriber = transcriber;
             return transcriber;

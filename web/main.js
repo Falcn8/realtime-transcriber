@@ -128,7 +128,10 @@
   var SETTINGS_VERSION = 2;
   var PLACEHOLDER_TEXT = "\u958B\u59CB\u3059\u308B\u3068\u3053\u3053\u306B\u8868\u793A\u3055\u308C\u307E\u3059\u3002";
   var WINDOWED_CAPTION_CHAR_LIMIT = 90;
-  var TRANSFORMERS_JS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+  var TRANSFORMERS_JS_CDN_CANDIDATES = [
+    "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1",
+    "https://esm.sh/@huggingface/transformers@3.8.1"
+  ];
   var LOCAL_WHISPER_MODEL = "Xenova/whisper-tiny";
   var LOCAL_WHISPER_SAMPLE_RATE = 16e3;
   var LOCAL_RECORDER_MIME_TYPES = [
@@ -404,7 +407,7 @@
     if (!normalized) {
       return "";
     }
-    const sentences = normalized.split(/(?<=[。！？.!?])\s*/).map((part) => part.trim()).filter(Boolean);
+    const sentences = (normalized.match(/[^。！？.!?]+[。！？.!?]?/g) || []).map((part) => part.trim()).filter(Boolean);
     const latest = sentences.length ? sentences[sentences.length - 1] : normalized;
     if (latest.length <= WINDOWED_CAPTION_CHAR_LIMIT) {
       return latest;
@@ -697,12 +700,46 @@
     if (!state.localTranscriberPromise) {
       state.localTranscriberPromise = (async () => {
         updateMessage("\u30ED\u30FC\u30AB\u30EB\u97F3\u58F0\u30E2\u30C7\u30EB\u3092\u8AAD\u307F\u8FBC\u3093\u3067\u3044\u307E\u3059\uFF08\u521D\u56DE\u306F\u6642\u9593\u304C\u304B\u304B\u308A\u307E\u3059\uFF09\u3002");
-        const { env, pipeline } = await import(TRANSFORMERS_JS_CDN);
+        let dynamicImport = null;
+        try {
+          dynamicImport = new Function("source", "return import(source);");
+        } catch (error) {
+          throw new Error("\u3053\u306E Safari \u306F\u30ED\u30FC\u30AB\u30EB\u97F3\u58F0\u30E2\u30C7\u30EB\u306E\u8AAD\u307F\u8FBC\u307F\u65B9\u5F0F\u306B\u672A\u5BFE\u5FDC\u3067\u3059\u3002Safari \u3092\u66F4\u65B0\u3057\u3066\u304F\u3060\u3055\u3044\u3002");
+        }
+        let moduleRef = null;
+        let lastError = null;
+        for (const source of TRANSFORMERS_JS_CDN_CANDIDATES) {
+          try {
+            moduleRef = await dynamicImport(source);
+            break;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        if (!moduleRef) {
+          const importError = new Error("\u30ED\u30FC\u30AB\u30EB\u30E2\u30C7\u30EB\u3092\u8AAD\u307F\u8FBC\u3081\u307E\u305B\u3093\u3067\u3057\u305F\u3002Safari \u3092\u6700\u65B0\u306B\u66F4\u65B0\u3057\u3066\u304F\u3060\u3055\u3044\u3002");
+          importError.cause = lastError;
+          throw importError;
+        }
+        const { env, pipeline } = moduleRef;
         env.allowLocalModels = false;
         env.useBrowserCache = true;
-        const transcriber = await pipeline("automatic-speech-recognition", LOCAL_WHISPER_MODEL, {
-          dtype: "q8"
-        });
+        let transcriber = null;
+        let transcriberError = null;
+        const dtypes = ["q4", "q8"];
+        for (const dtype of dtypes) {
+          try {
+            transcriber = await pipeline("automatic-speech-recognition", LOCAL_WHISPER_MODEL, { dtype });
+            break;
+          } catch (error) {
+            transcriberError = error;
+          }
+        }
+        if (!transcriber) {
+          const initError = new Error("\u30ED\u30FC\u30AB\u30EB\u97F3\u58F0\u30E2\u30C7\u30EB\u306E\u521D\u671F\u5316\u306B\u5931\u6557\u3057\u307E\u3057\u305F\u3002");
+          initError.cause = transcriberError;
+          throw initError;
+        }
         state.localTranscriber = transcriber;
         return transcriber;
       })().finally(() => {
