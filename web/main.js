@@ -128,6 +128,15 @@
   var SETTINGS_VERSION = 2;
   var PLACEHOLDER_TEXT = "\u958B\u59CB\u3059\u308B\u3068\u3053\u3053\u306B\u8868\u793A\u3055\u308C\u307E\u3059\u3002";
   var WINDOWED_CAPTION_CHAR_LIMIT = 90;
+  var TRANSFORMERS_JS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+  var LOCAL_WHISPER_MODEL = "Xenova/whisper-tiny";
+  var LOCAL_WHISPER_SAMPLE_RATE = 16e3;
+  var LOCAL_RECORDER_MIME_TYPES = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+    "audio/mpeg"
+  ];
   var LANGUAGE_GROUPS = [
     {
       label: "\u65E5\u672C\u8A9E",
@@ -225,8 +234,17 @@
   };
   var state = {
     recognition: null,
+    mediaRecorder: null,
+    mediaStream: null,
+    audioDecodeContext: null,
+    localTranscriber: null,
+    localTranscriberPromise: null,
+    recorderMimeType: "",
+    transcribeQueue: Promise.resolve(),
     shouldRun: false,
     isListening: false,
+    activeEngine: "none",
+    runningEngine: "none",
     browserLabel: "",
     lastFinalText: "",
     interimText: "",
@@ -246,6 +264,29 @@
   }
   function getSpeechRecognitionConstructor() {
     return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  }
+  function getAudioContextConstructor() {
+    return window.AudioContext || window.webkitAudioContext || null;
+  }
+  function hasBrowserRecognitionSupport() {
+    return !!getSpeechRecognitionConstructor();
+  }
+  function hasLocalTranscriptionSupport() {
+    return !!(navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function" && typeof window.MediaRecorder === "function" && !!getAudioContextConstructor());
+  }
+  function resolvePreferredEngine() {
+    const hasBrowser = hasBrowserRecognitionSupport();
+    const hasLocal = hasLocalTranscriptionSupport();
+    if (state.browserLabel === "Safari" && hasLocal) {
+      return "local";
+    }
+    if (hasBrowser) {
+      return "browser";
+    }
+    if (hasLocal) {
+      return "local";
+    }
+    return "none";
   }
   function detectBrowser() {
     const userAgent = navigator.userAgent;
@@ -317,11 +358,14 @@
     return LANGUAGE_GROUPS[index] || LANGUAGE_GROUPS[0];
   }
   function defaultHelpMessage() {
-    if (!getSpeechRecognitionConstructor()) {
-      return "Chrome \u307E\u305F\u306F Edge \u3092\u3054\u5229\u7528\u304F\u3060\u3055\u3044\u3002";
+    if (state.activeEngine === "local") {
+      if (state.browserLabel === "Safari") {
+        return "Safari \u306F\u30ED\u30FC\u30AB\u30EB\u8A8D\u8B58\u30E2\u30FC\u30C9\u3067\u52D5\u4F5C\u3057\u307E\u3059\u3002";
+      }
+      return "\u3053\u306E\u30D6\u30E9\u30A6\u30B6\u306F\u30ED\u30FC\u30AB\u30EB\u8A8D\u8B58\u30E2\u30FC\u30C9\u3067\u52D5\u4F5C\u3057\u307E\u3059\u3002";
     }
-    if (state.browserLabel === "Safari") {
-      return "Safari \u3067\u306F\u52D5\u4F5C\u304C\u4E0D\u5B89\u5B9A\u306A\u5834\u5408\u304C\u3042\u308A\u307E\u3059\u3002";
+    if (state.activeEngine === "none") {
+      return "\u97F3\u58F0\u8A8D\u8B58\u306B\u5BFE\u5FDC\u3057\u3066\u3044\u307E\u305B\u3093\u3002Chrome / Edge / Safari (\u6700\u65B0\u7248) \u3092\u3054\u5229\u7528\u304F\u3060\u3055\u3044\u3002";
     }
     return "";
   }
@@ -479,15 +523,15 @@
     }
     state.restartTimerId = window.setTimeout(() => {
       state.restartTimerId = 0;
-      startRecognition();
+      startTranscription();
     }, delayMs);
   }
   function stopRecognition(options = {}) {
     const restart = !!options.restart;
     state.restartOnEnd = restart;
     clearRestartTimer();
-    if (options.message) {
-      updateMessage(options.message);
+    if (Object.prototype.hasOwnProperty.call(options, "message")) {
+      updateMessage(options.message || "");
     }
     if (state.recognition) {
       try {
@@ -502,6 +546,207 @@
     } else if (restart) {
       scheduleRecognitionStart(200);
     }
+  }
+  function stopMediaStream() {
+    if (!state.mediaStream) {
+      return;
+    }
+    state.mediaStream.getTracks().forEach((track) => track.stop());
+    state.mediaStream = null;
+  }
+  function resetLocalRecorderState() {
+    state.mediaRecorder = null;
+    state.recorderMimeType = "";
+    stopMediaStream();
+    if (state.runningEngine === "local") {
+      state.runningEngine = "none";
+    }
+  }
+  function stopLocalTranscription(options = {}) {
+    const restart = !!options.restart;
+    state.restartOnEnd = restart;
+    clearRestartTimer();
+    if (Object.prototype.hasOwnProperty.call(options, "message")) {
+      updateMessage(options.message || "");
+    }
+    if (state.mediaRecorder && state.mediaRecorder.state !== "inactive") {
+      try {
+        state.mediaRecorder.requestData();
+      } catch (error) {
+        log("media recorder requestData failed: " + error);
+      }
+      try {
+        state.mediaRecorder.stop();
+      } catch (error) {
+        log("media recorder stop failed: " + error);
+        resetLocalRecorderState();
+        state.isListening = false;
+        updateMetrics();
+        if (restart) {
+          scheduleRecognitionStart(200);
+        }
+      }
+      return;
+    }
+    resetLocalRecorderState();
+    state.isListening = false;
+    updateMetrics();
+    if (restart) {
+      scheduleRecognitionStart(200);
+    }
+  }
+  function stopActiveTranscription(options = {}) {
+    if (state.runningEngine === "local" || state.mediaRecorder) {
+      stopLocalTranscription(options);
+      return;
+    }
+    stopRecognition(options);
+  }
+  function pickRecorderMimeType() {
+    if (!window.MediaRecorder || typeof MediaRecorder.isTypeSupported !== "function") {
+      return "";
+    }
+    const supported = LOCAL_RECORDER_MIME_TYPES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+    return supported || "";
+  }
+  function getOrCreateAudioDecodeContext() {
+    if (state.audioDecodeContext) {
+      return state.audioDecodeContext;
+    }
+    const AudioContextConstructor = getAudioContextConstructor();
+    if (!AudioContextConstructor) {
+      return null;
+    }
+    state.audioDecodeContext = new AudioContextConstructor();
+    return state.audioDecodeContext;
+  }
+  function decodeAudioDataCompat(context, arrayBuffer) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onSuccess = (buffer) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve(buffer);
+      };
+      const onError = (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        reject(error);
+      };
+      try {
+        const maybePromise = context.decodeAudioData(arrayBuffer, onSuccess, onError);
+        if (maybePromise && typeof maybePromise.then === "function") {
+          maybePromise.then(onSuccess).catch(onError);
+        }
+      } catch (error) {
+        onError(error);
+      }
+    });
+  }
+  function downmixToMono(audioBuffer) {
+    if (audioBuffer.numberOfChannels <= 1) {
+      return new Float32Array(audioBuffer.getChannelData(0));
+    }
+    const mono = new Float32Array(audioBuffer.length);
+    for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
+      const data = audioBuffer.getChannelData(channel);
+      for (let i = 0; i < data.length; i += 1) {
+        mono[i] += data[i];
+      }
+    }
+    const scale = 1 / audioBuffer.numberOfChannels;
+    for (let i = 0; i < mono.length; i += 1) {
+      mono[i] *= scale;
+    }
+    return mono;
+  }
+  function resampleLinear(input, inputRate, outputRate) {
+    if (!input.length || inputRate === outputRate) {
+      return input;
+    }
+    const ratio = inputRate / outputRate;
+    const outputLength = Math.max(1, Math.round(input.length / ratio));
+    const output = new Float32Array(outputLength);
+    for (let i = 0; i < outputLength; i += 1) {
+      const position = i * ratio;
+      const left = Math.floor(position);
+      const right = Math.min(left + 1, input.length - 1);
+      const blend = position - left;
+      output[i] = input[left] + (input[right] - input[left]) * blend;
+    }
+    return output;
+  }
+  async function convertBlobToWhisperInput(blob) {
+    const context = getOrCreateAudioDecodeContext();
+    if (!context) {
+      throw new Error("AudioContext \u304C\u5229\u7528\u3067\u304D\u307E\u305B\u3093\u3002");
+    }
+    const arrayBuffer = await blob.arrayBuffer();
+    const decoded = await decodeAudioDataCompat(context, arrayBuffer.slice(0));
+    const mono = downmixToMono(decoded);
+    return resampleLinear(mono, decoded.sampleRate, LOCAL_WHISPER_SAMPLE_RATE);
+  }
+  async function ensureLocalTranscriber() {
+    if (state.localTranscriber) {
+      return state.localTranscriber;
+    }
+    if (!state.localTranscriberPromise) {
+      state.localTranscriberPromise = (async () => {
+        updateMessage("\u30ED\u30FC\u30AB\u30EB\u97F3\u58F0\u30E2\u30C7\u30EB\u3092\u8AAD\u307F\u8FBC\u3093\u3067\u3044\u307E\u3059\uFF08\u521D\u56DE\u306F\u6642\u9593\u304C\u304B\u304B\u308A\u307E\u3059\uFF09\u3002");
+        const { env, pipeline } = await import(TRANSFORMERS_JS_CDN);
+        env.allowLocalModels = false;
+        env.useBrowserCache = true;
+        const transcriber = await pipeline("automatic-speech-recognition", LOCAL_WHISPER_MODEL, {
+          dtype: "q8"
+        });
+        state.localTranscriber = transcriber;
+        return transcriber;
+      })().finally(() => {
+        state.localTranscriberPromise = null;
+      });
+    }
+    return state.localTranscriberPromise;
+  }
+  function extractTranscribeText(output) {
+    if (typeof output === "string") {
+      return output;
+    }
+    if (output && typeof output.text === "string") {
+      return output.text;
+    }
+    return "";
+  }
+  async function transcribeAudioChunk(blob) {
+    const transcriber = await ensureLocalTranscriber();
+    const audioData = await convertBlobToWhisperInput(blob);
+    const output = await transcriber(audioData);
+    const finalized = finalizeTranscript(extractTranscribeText(output));
+    if (!finalized) {
+      return;
+    }
+    state.lastFinalText = finalized;
+    state.interimText = "";
+    appendLogEntry(finalized);
+    renderCaption();
+    scheduleAutoClear();
+  }
+  function queueTranscriptionChunk(blob) {
+    if (!blob || blob.size === 0) {
+      return;
+    }
+    state.transcribeQueue = state.transcribeQueue.then(() => transcribeAudioChunk(blob)).catch((error) => {
+      log("transcribe chunk failed: " + error);
+      state.shouldRun = false;
+      state.restartOnEnd = false;
+      setStatus("\u30A8\u30E9\u30FC", "error");
+      updateMessage(error.message || "\u30ED\u30FC\u30AB\u30EB\u6587\u5B57\u8D77\u3053\u3057\u306B\u5931\u6557\u3057\u307E\u3057\u305F\u3002");
+      stopLocalTranscription({ restart: false });
+      updateActionState();
+    });
   }
   function bindRecognitionHandlers(recognition) {
     recognition.lang = state.config.dialect;
@@ -572,6 +817,9 @@
     };
     recognition.onend = () => {
       state.recognition = null;
+      if (state.runningEngine === "browser") {
+        state.runningEngine = "none";
+      }
       state.isListening = false;
       updateMetrics();
       if (state.shouldRun) {
@@ -598,6 +846,7 @@
     }
     const recognition = new SpeechRecognitionConstructor();
     state.recognition = recognition;
+    state.runningEngine = "browser";
     bindRecognitionHandlers(recognition);
     if (!state.sessionStartedAt) {
       state.sessionStartedAt = /* @__PURE__ */ new Date();
@@ -611,6 +860,9 @@
     } catch (error) {
       log("recognition start failed: " + error);
       state.recognition = null;
+      if (state.runningEngine === "browser") {
+        state.runningEngine = "none";
+      }
       setStatus("\u30A8\u30E9\u30FC", "error");
       updateMessage("\u958B\u59CB\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F\u3002");
       if (state.shouldRun) {
@@ -618,22 +870,155 @@
       }
     }
   }
+  async function startLocalTranscription() {
+    if (!hasLocalTranscriptionSupport()) {
+      setStatus("\u672A\u5BFE\u5FDC", "error");
+      updateMessage(defaultHelpMessage());
+      updateActionState();
+      return;
+    }
+    if (state.mediaRecorder && state.mediaRecorder.state !== "inactive") {
+      return;
+    }
+    if (!state.sessionStartedAt) {
+      state.sessionStartedAt = /* @__PURE__ */ new Date();
+    }
+    state.sessionEndedAt = null;
+    setStatus("\u6E96\u5099\u4E2D", "warn");
+    updateMessage("\u30DE\u30A4\u30AF\u3078\u306E\u30A2\u30AF\u30BB\u30B9\u3092\u8A31\u53EF\u3057\u3066\u304F\u3060\u3055\u3044\u3002");
+    updateActionState();
+    ensureLocalTranscriber().catch((error) => {
+      log("local model load failed: " + error);
+      if (!state.shouldRun || state.runningEngine !== "local") {
+        return;
+      }
+      state.shouldRun = false;
+      state.restartOnEnd = false;
+      setStatus("\u30A8\u30E9\u30FC", "error");
+      updateMessage(error.message || "\u30ED\u30FC\u30AB\u30EB\u97F3\u58F0\u30E2\u30C7\u30EB\u3092\u8AAD\u307F\u8FBC\u3081\u307E\u305B\u3093\u3067\u3057\u305F\u3002");
+      stopLocalTranscription({ restart: false });
+      updateActionState();
+    });
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+      if (!state.shouldRun) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      const mimeType = pickRecorderMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      state.mediaStream = stream;
+      state.mediaRecorder = recorder;
+      state.recorderMimeType = recorder.mimeType || mimeType || "";
+      state.runningEngine = "local";
+      state.transcribeQueue = Promise.resolve();
+      recorder.onstart = () => {
+        state.isListening = true;
+        setStatus("\u8A8D\u8B58\u4E2D", "active");
+        if (state.localTranscriber) {
+          updateMessage("");
+        } else {
+          updateMessage("\u30ED\u30FC\u30AB\u30EB\u97F3\u58F0\u30E2\u30C7\u30EB\u3092\u6E96\u5099\u4E2D\u3067\u3059\uFF08\u521D\u56DE\u306F\u6642\u9593\u304C\u304B\u304B\u308A\u307E\u3059\uFF09\u3002");
+        }
+        updateMetrics();
+      };
+      recorder.onerror = (event) => {
+        const errorName = event && event.error && event.error.name ? event.error.name : "unknown";
+        log("media recorder error: " + errorName);
+        state.isListening = false;
+        updateMetrics();
+        if (state.shouldRun) {
+          setStatus("\u518D\u63A5\u7D9A", "warn");
+          updateMessage("\u518D\u63A5\u7D9A\u3057\u3066\u3044\u307E\u3059...");
+          stopLocalTranscription({ restart: true, message: "\u518D\u63A5\u7D9A\u3057\u3066\u3044\u307E\u3059..." });
+        }
+      };
+      recorder.ondataavailable = (event) => {
+        if (!event.data || event.data.size === 0) {
+          return;
+        }
+        queueTranscriptionChunk(event.data);
+      };
+      recorder.onstop = () => {
+        const pending = state.transcribeQueue;
+        resetLocalRecorderState();
+        state.isListening = false;
+        updateMetrics();
+        pending.finally(() => {
+          if (state.shouldRun) {
+            setStatus("\u5F85\u6A5F\u4E2D", "ready");
+            scheduleRecognitionStart(state.restartOnEnd ? 120 : 260);
+          } else {
+            setStatus("\u5F85\u6A5F\u4E2D", "ready");
+            updateMessage(defaultHelpMessage());
+          }
+          state.restartOnEnd = false;
+          updateActionState();
+        });
+      };
+      recorder.start(2200);
+    } catch (error) {
+      log("local transcription start failed: " + error);
+      resetLocalRecorderState();
+      state.isListening = false;
+      updateMetrics();
+      const isPermissionError = error && (error.name === "NotAllowedError" || error.name === "SecurityError");
+      if (isPermissionError) {
+        state.shouldRun = false;
+        state.restartOnEnd = false;
+        setStatus("\u30DE\u30A4\u30AF\u4E0D\u53EF", "error");
+        updateMessage("\u30DE\u30A4\u30AF\u3078\u306E\u30A2\u30AF\u30BB\u30B9\u304C\u30D6\u30ED\u30C3\u30AF\u3055\u308C\u3066\u3044\u307E\u3059\u3002");
+        updateActionState();
+        return;
+      }
+      setStatus("\u30A8\u30E9\u30FC", "error");
+      updateMessage("\u958B\u59CB\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F\u3002");
+      if (state.shouldRun) {
+        scheduleRecognitionStart(800);
+      }
+    }
+  }
+  function startTranscription() {
+    state.activeEngine = resolvePreferredEngine();
+    if (state.activeEngine === "browser") {
+      startRecognition();
+      return;
+    }
+    if (state.activeEngine === "local") {
+      startLocalTranscription();
+      return;
+    }
+    state.shouldRun = false;
+    setStatus("\u672A\u5BFE\u5FDC", "error");
+    updateMessage(defaultHelpMessage());
+    updateActionState();
+  }
   function toggleRecognition() {
     if (state.shouldRun) {
       state.shouldRun = false;
       state.sessionEndedAt = /* @__PURE__ */ new Date();
-      stopRecognition({ restart: false, message: "" });
+      stopActiveTranscription({ restart: false, message: "" });
       updateActionState();
       return;
     }
+    state.browserLabel = detectBrowser();
+    state.activeEngine = resolvePreferredEngine();
+    updateMetrics();
     state.shouldRun = true;
-    refreshSupportState();
-    if (!getSpeechRecognitionConstructor()) {
+    if (state.activeEngine === "none") {
       state.shouldRun = false;
+      setStatus("\u672A\u5BFE\u5FDC", "error");
+      updateMessage(defaultHelpMessage());
       updateActionState();
       return;
     }
-    startRecognition();
+    startTranscription();
     updateActionState();
   }
   function populateLanguageGroups() {
@@ -660,7 +1045,7 @@
   function handleLanguageGroupChange() {
     populateDialects(state.config.dialect);
     if (state.shouldRun) {
-      stopRecognition({ restart: true, message: "\u8A2D\u5B9A\u3092\u66F4\u65B0\u3057\u3066\u3044\u307E\u3059..." });
+      stopActiveTranscription({ restart: true, message: "\u8A2D\u5B9A\u3092\u66F4\u65B0\u3057\u3066\u3044\u307E\u3059..." });
     } else {
       updateMessage(defaultHelpMessage());
     }
@@ -670,7 +1055,7 @@
     saveConfig();
     updateMetrics();
     if (state.shouldRun) {
-      stopRecognition({ restart: true, message: "\u8A2D\u5B9A\u3092\u66F4\u65B0\u3057\u3066\u3044\u307E\u3059..." });
+      stopActiveTranscription({ restart: true, message: "\u8A2D\u5B9A\u3092\u66F4\u65B0\u3057\u3066\u3044\u307E\u3059..." });
     }
   }
   function handleAutoClearChange() {
@@ -746,12 +1131,13 @@
   }
   function refreshSupportState() {
     state.browserLabel = detectBrowser();
+    state.activeEngine = resolvePreferredEngine();
     updateMetrics();
     if (state.shouldRun) {
       updateActionState();
       return;
     }
-    if (!getSpeechRecognitionConstructor()) {
+    if (state.activeEngine === "none") {
       setStatus("\u672A\u5BFE\u5FDC", "error");
       updateMessage(defaultHelpMessage());
     } else {
@@ -785,11 +1171,11 @@
     elements.checkboxShowLog.addEventListener("input", handleShowLogToggle);
     elements.resultLog.addEventListener("input", handleLogInput);
     document.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" || !state.shouldRun || !state.recognition) {
+      if (event.key !== "Enter" || !state.shouldRun || state.runningEngine === "none") {
         return;
       }
       event.preventDefault();
-      stopRecognition({ restart: true, message: "" });
+      stopActiveTranscription({ restart: true, message: "" });
     });
     document.addEventListener("fullscreenchange", renderCaption);
   }
@@ -815,6 +1201,18 @@
       } catch (error) {
         log("recognition stop on unload failed: " + error);
       }
+    }
+    if (state.mediaRecorder && state.mediaRecorder.state !== "inactive") {
+      try {
+        state.mediaRecorder.stop();
+      } catch (error) {
+        log("media recorder stop on unload failed: " + error);
+      }
+    }
+    stopMediaStream();
+    if (state.audioDecodeContext && typeof state.audioDecodeContext.close === "function") {
+      state.audioDecodeContext.close().catch(() => {
+      });
     }
   });
   initialize();

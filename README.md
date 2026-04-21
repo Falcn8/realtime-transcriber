@@ -12,6 +12,15 @@
 - テキストファイルとしてダウンロード
 - 言語の切り替え
 - 全画面表示、文字サイズ、行間の調整
+- Safari 向けローカル文字起こしフォールバック（Whisper）
+
+## Safari 対応について
+
+- Chrome / Edge: ブラウザ内の音声認識 API を使用
+- Safari: `MediaRecorder` + ブラウザ内 Whisper（Transformers.js / WASM）を使用
+
+このフォールバックは OpenAI API を使わないため、API 課金は発生しません。
+初回はモデルのダウンロードに時間がかかる場合があります。
 
 ## ローカル環境
 
@@ -29,5 +38,4 @@ vercel --prod
 
 - Chrome
 - Edge
-
-※ Safari は動作が不安定な場合があります。
+- Safari
