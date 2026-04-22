@@ -8,6 +8,8 @@ const TRANSFORMERS_JS_CDN_CANDIDATES = [
 ];
 const LOCAL_WHISPER_MODEL = 'Xenova/whisper-tiny';
 const LOCAL_WHISPER_SAMPLE_RATE = 16000;
+const LOCAL_CHUNK_DURATION_MS_DEFAULT = 3500;
+const LOCAL_CHUNK_DURATION_MS_SAFARI = 6000;
 const LOCAL_RECORDER_MIME_TYPES = [
     'audio/webm;codecs=opus',
     'audio/webm',
@@ -121,6 +123,9 @@ const state = {
     localTranscriberPromise: null,
     recorderMimeType: '',
     transcribeQueue: Promise.resolve(),
+    transcribeInFlight: false,
+    pendingChunkBlob: null,
+    localChunkErrorStreak: 0,
     shouldRun: false,
     isListening: false,
     activeEngine: 'none',
@@ -169,8 +174,14 @@ function resolvePreferredEngine() {
     const hasBrowser = hasBrowserRecognitionSupport();
     const hasLocal = hasLocalTranscriptionSupport();
 
-    if (state.browserLabel === 'Safari' && hasLocal) {
-        return 'local';
+    if (state.browserLabel === 'Safari') {
+        if (hasBrowser) {
+            return 'browser';
+        }
+        if (hasLocal) {
+            return 'local';
+        }
+        return 'none';
     }
 
     if (hasBrowser) {
@@ -527,6 +538,9 @@ function stopMediaStream() {
 function resetLocalRecorderState() {
     state.mediaRecorder = null;
     state.recorderMimeType = '';
+    state.pendingChunkBlob = null;
+    state.transcribeInFlight = false;
+    state.localChunkErrorStreak = 0;
     stopMediaStream();
     if (state.runningEngine === 'local') {
         state.runningEngine = 'none';
@@ -586,6 +600,13 @@ function pickRecorderMimeType() {
 
     const supported = LOCAL_RECORDER_MIME_TYPES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
     return supported || '';
+}
+
+function getLocalChunkDurationMs() {
+    if (state.browserLabel === 'Safari') {
+        return LOCAL_CHUNK_DURATION_MS_SAFARI;
+    }
+    return LOCAL_CHUNK_DURATION_MS_DEFAULT;
 }
 
 function getOrCreateAudioDecodeContext() {
@@ -777,22 +798,78 @@ async function transcribeAudioChunk(blob) {
     scheduleAutoClear();
 }
 
+function shouldTreatChunkErrorAsFatal(errorMessage, errorStreak) {
+    if (errorStreak >= 3) {
+        return true;
+    }
+    const normalized = String(errorMessage || '').toLowerCase();
+    return (
+        normalized.includes('out of memory')
+        || normalized.includes('insufficient memory')
+        || normalized.includes('webassembly')
+    );
+}
+
+function stopFromLocalChunkError(error) {
+    const errorMessage = error && error.message ? error.message : '';
+    state.shouldRun = false;
+    state.restartOnEnd = false;
+    setStatus('エラー', 'error');
+    updateMessage(errorMessage || 'ローカル文字起こしに失敗しました。');
+    stopLocalTranscription({ restart: false });
+    updateActionState();
+}
+
+function processLocalChunk(blob) {
+    state.transcribeInFlight = true;
+
+    state.transcribeQueue = transcribeAudioChunk(blob)
+        .then(() => {
+            state.localChunkErrorStreak = 0;
+        })
+        .catch((error) => {
+            log('transcribe chunk failed: ' + error);
+            state.localChunkErrorStreak += 1;
+
+            const errorMessage = error && error.message ? error.message : '';
+            if (shouldTreatChunkErrorAsFatal(errorMessage, state.localChunkErrorStreak)) {
+                stopFromLocalChunkError(error);
+                return;
+            }
+
+            if (state.shouldRun) {
+                updateMessage('一部の音声チャンクを処理できませんでした。継続しています...');
+            }
+        })
+        .finally(() => {
+            if (!state.shouldRun) {
+                state.pendingChunkBlob = null;
+                state.transcribeInFlight = false;
+                return;
+            }
+
+            if (state.pendingChunkBlob) {
+                const pendingBlob = state.pendingChunkBlob;
+                state.pendingChunkBlob = null;
+                processLocalChunk(pendingBlob);
+                return;
+            }
+
+            state.transcribeInFlight = false;
+        });
+}
+
 function queueTranscriptionChunk(blob) {
     if (!blob || blob.size === 0) {
         return;
     }
 
-    state.transcribeQueue = state.transcribeQueue
-        .then(() => transcribeAudioChunk(blob))
-        .catch((error) => {
-            log('transcribe chunk failed: ' + error);
-            state.shouldRun = false;
-            state.restartOnEnd = false;
-            setStatus('エラー', 'error');
-            updateMessage(error.message || 'ローカル文字起こしに失敗しました。');
-            stopLocalTranscription({ restart: false });
-            updateActionState();
-        });
+    if (state.transcribeInFlight) {
+        state.pendingChunkBlob = blob;
+        return;
+    }
+
+    processLocalChunk(blob);
 }
 
 function bindRecognitionHandlers(recognition) {
@@ -997,6 +1074,9 @@ async function startLocalTranscription() {
         state.recorderMimeType = recorder.mimeType || mimeType || '';
         state.runningEngine = 'local';
         state.transcribeQueue = Promise.resolve();
+        state.transcribeInFlight = false;
+        state.pendingChunkBlob = null;
+        state.localChunkErrorStreak = 0;
 
         recorder.onstart = () => {
             state.isListening = true;
@@ -1049,7 +1129,7 @@ async function startLocalTranscription() {
             });
         };
 
-        recorder.start(2200);
+        recorder.start(getLocalChunkDurationMs());
     } catch (error) {
         log('local transcription start failed: ' + error);
         resetLocalRecorderState();

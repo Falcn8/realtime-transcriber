@@ -134,6 +134,8 @@
   ];
   var LOCAL_WHISPER_MODEL = "Xenova/whisper-tiny";
   var LOCAL_WHISPER_SAMPLE_RATE = 16e3;
+  var LOCAL_CHUNK_DURATION_MS_DEFAULT = 3500;
+  var LOCAL_CHUNK_DURATION_MS_SAFARI = 6e3;
   var LOCAL_RECORDER_MIME_TYPES = [
     "audio/webm;codecs=opus",
     "audio/webm",
@@ -244,6 +246,9 @@
     localTranscriberPromise: null,
     recorderMimeType: "",
     transcribeQueue: Promise.resolve(),
+    transcribeInFlight: false,
+    pendingChunkBlob: null,
+    localChunkErrorStreak: 0,
     shouldRun: false,
     isListening: false,
     activeEngine: "none",
@@ -280,8 +285,14 @@
   function resolvePreferredEngine() {
     const hasBrowser = hasBrowserRecognitionSupport();
     const hasLocal = hasLocalTranscriptionSupport();
-    if (state.browserLabel === "Safari" && hasLocal) {
-      return "local";
+    if (state.browserLabel === "Safari") {
+      if (hasBrowser) {
+        return "browser";
+      }
+      if (hasLocal) {
+        return "local";
+      }
+      return "none";
     }
     if (hasBrowser) {
       return "browser";
@@ -560,6 +571,9 @@
   function resetLocalRecorderState() {
     state.mediaRecorder = null;
     state.recorderMimeType = "";
+    state.pendingChunkBlob = null;
+    state.transcribeInFlight = false;
+    state.localChunkErrorStreak = 0;
     stopMediaStream();
     if (state.runningEngine === "local") {
       state.runningEngine = "none";
@@ -611,6 +625,12 @@
     }
     const supported = LOCAL_RECORDER_MIME_TYPES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
     return supported || "";
+  }
+  function getLocalChunkDurationMs() {
+    if (state.browserLabel === "Safari") {
+      return LOCAL_CHUNK_DURATION_MS_SAFARI;
+    }
+    return LOCAL_CHUNK_DURATION_MS_DEFAULT;
   }
   function getOrCreateAudioDecodeContext() {
     if (state.audioDecodeContext) {
@@ -771,19 +791,61 @@
     renderCaption();
     scheduleAutoClear();
   }
+  function shouldTreatChunkErrorAsFatal(errorMessage, errorStreak) {
+    if (errorStreak >= 3) {
+      return true;
+    }
+    const normalized = String(errorMessage || "").toLowerCase();
+    return normalized.includes("out of memory") || normalized.includes("insufficient memory") || normalized.includes("webassembly");
+  }
+  function stopFromLocalChunkError(error) {
+    const errorMessage = error && error.message ? error.message : "";
+    state.shouldRun = false;
+    state.restartOnEnd = false;
+    setStatus("\u30A8\u30E9\u30FC", "error");
+    updateMessage(errorMessage || "\u30ED\u30FC\u30AB\u30EB\u6587\u5B57\u8D77\u3053\u3057\u306B\u5931\u6557\u3057\u307E\u3057\u305F\u3002");
+    stopLocalTranscription({ restart: false });
+    updateActionState();
+  }
+  function processLocalChunk(blob) {
+    state.transcribeInFlight = true;
+    state.transcribeQueue = transcribeAudioChunk(blob).then(() => {
+      state.localChunkErrorStreak = 0;
+    }).catch((error) => {
+      log("transcribe chunk failed: " + error);
+      state.localChunkErrorStreak += 1;
+      const errorMessage = error && error.message ? error.message : "";
+      if (shouldTreatChunkErrorAsFatal(errorMessage, state.localChunkErrorStreak)) {
+        stopFromLocalChunkError(error);
+        return;
+      }
+      if (state.shouldRun) {
+        updateMessage("\u4E00\u90E8\u306E\u97F3\u58F0\u30C1\u30E3\u30F3\u30AF\u3092\u51E6\u7406\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F\u3002\u7D99\u7D9A\u3057\u3066\u3044\u307E\u3059...");
+      }
+    }).finally(() => {
+      if (!state.shouldRun) {
+        state.pendingChunkBlob = null;
+        state.transcribeInFlight = false;
+        return;
+      }
+      if (state.pendingChunkBlob) {
+        const pendingBlob = state.pendingChunkBlob;
+        state.pendingChunkBlob = null;
+        processLocalChunk(pendingBlob);
+        return;
+      }
+      state.transcribeInFlight = false;
+    });
+  }
   function queueTranscriptionChunk(blob) {
     if (!blob || blob.size === 0) {
       return;
     }
-    state.transcribeQueue = state.transcribeQueue.then(() => transcribeAudioChunk(blob)).catch((error) => {
-      log("transcribe chunk failed: " + error);
-      state.shouldRun = false;
-      state.restartOnEnd = false;
-      setStatus("\u30A8\u30E9\u30FC", "error");
-      updateMessage(error.message || "\u30ED\u30FC\u30AB\u30EB\u6587\u5B57\u8D77\u3053\u3057\u306B\u5931\u6557\u3057\u307E\u3057\u305F\u3002");
-      stopLocalTranscription({ restart: false });
-      updateActionState();
-    });
+    if (state.transcribeInFlight) {
+      state.pendingChunkBlob = blob;
+      return;
+    }
+    processLocalChunk(blob);
   }
   function bindRecognitionHandlers(recognition) {
     recognition.lang = state.config.dialect;
@@ -955,6 +1017,9 @@
       state.recorderMimeType = recorder.mimeType || mimeType || "";
       state.runningEngine = "local";
       state.transcribeQueue = Promise.resolve();
+      state.transcribeInFlight = false;
+      state.pendingChunkBlob = null;
+      state.localChunkErrorStreak = 0;
       recorder.onstart = () => {
         state.isListening = true;
         setStatus("\u8A8D\u8B58\u4E2D", "active");
@@ -999,7 +1064,7 @@
           updateActionState();
         });
       };
-      recorder.start(2200);
+      recorder.start(getLocalChunkDurationMs());
     } catch (error) {
       log("local transcription start failed: " + error);
       resetLocalRecorderState();
